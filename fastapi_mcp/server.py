@@ -84,6 +84,15 @@ class FastApiMCP:
                 """
             ),
         ] = ["authorization"],
+        debug_mode: Annotated[
+            bool,
+            Doc(
+                """
+                Enable debug mode for more detailed error reporting and logging.
+                This is useful for troubleshooting in production environments.
+                """
+            ),
+        ] = False,
     ):
         # Validate operation and tag filtering options
         if include_operations is not None and exclude_operations is not None:
@@ -120,6 +129,7 @@ class FastApiMCP:
 
         self._forward_headers = {h.lower() for h in headers}
         self._http_transport: FastApiHttpSessionManager | None = None  # Store reference to HTTP transport for cleanup
+        self._debug_mode = debug_mode
 
         self.setup_server()
 
@@ -556,19 +566,121 @@ class FastApiMCP:
             # If not raising an exception, the MCP server will return the result as a regular text response, without marking it as an error.
             # TODO: Use a raise_for_status() method on the response (it needs to also be implemented in the AsyncClientProtocol)
             if 400 <= response.status_code < 600:
-                raise Exception(
-                    f"Error calling {tool_name}. Status code: {response.status_code}. Response: {response.text}"
-                )
+                # Try to extract detailed error information from the response
+                server_error_details = self._extract_error_details(response)
+                
+                # Create a more detailed error message with request information
+                error_details = {
+                    "tool_name": tool_name,
+                    "status_code": response.status_code,
+                    "response_text": response.text,
+                    "request_method": method,
+                    "request_path": path,
+                    "request_headers": {k: v for k, v in headers.items() if k.lower() not in ["authorization"]},
+                    "request_query": query,
+                    "server_error": server_error_details
+                }
+                
+                # Log detailed error information
+                if self._debug_mode:
+                    # In debug mode, log the full request and response details
+                    logger.error(f"API call failed: {json.dumps(error_details, default=str)}")
+                    
+                    # Log request body if available
+                    if body is not None:
+                        try:
+                            body_str = json.dumps(body) if not isinstance(body, str) else body
+                            logger.error(f"Request body for {tool_name}: {body_str}")
+                        except Exception:
+                            logger.error(f"Could not serialize request body for {tool_name}")
+                else:
+                    # In normal mode, log a more concise error message
+                    logger.error(f"API call failed: {tool_name}, status: {response.status_code}")
+                
+                # Create a more informative error message
+                error_message = f"Error calling {tool_name}. Status code: {response.status_code}. Request: {method} {path}"
+                
+                # Add server error details if available
+                if server_error_details and isinstance(server_error_details, dict):
+                    if "detail" in server_error_details:
+                        error_message += f". Server error: {server_error_details['detail']}"
+                    elif "message" in server_error_details:
+                        error_message += f". Server error: {server_error_details['message']}"
+                
+                # Add response text if no structured error was found
+                if not server_error_details and response.text:
+                    error_message += f". Response: {response.text}"
+                
+                raise Exception(error_message)
 
             try:
                 return [types.TextContent(type="text", text=result_text)]
             except ValueError:
                 return [types.TextContent(type="text", text=result_text)]
 
+        except httpx.HTTPStatusError as e:
+            # Handle HTTP status errors with detailed information
+            logger.exception(f"HTTP error calling {tool_name}: {e}")
+            raise
+            
+        except httpx.RequestError as e:
+            # Handle request errors (connection, timeout, etc.)
+            logger.exception(f"Request error calling {tool_name}: {e}")
+            raise Exception(f"Connection error calling {tool_name}: {str(e)}")
+            
         except Exception as e:
+            # Capture and log detailed error information for other exceptions
             logger.exception(f"Error calling {tool_name}: {e}")
-            raise e
+            
+            # Include more context in the re-raised exception
+            error_msg = f"Error executing API tool '{tool_name}': {str(e)}"
+            if hasattr(e, '__traceback__'):
+                import traceback
+                tb_str = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
+                logger.error(f"Detailed traceback for {tool_name}: {tb_str}")
+                
+            raise Exception(error_msg) from e
 
+    def _extract_error_details(self, response):
+        """
+        Extract detailed error information from a response.
+        
+        Args:
+            response: The HTTP response object
+            
+        Returns:
+            Dict or None: Extracted error details if available
+        """
+        server_error_details = None
+        
+        # Try to parse as JSON first
+        try:
+            if response.text and response.headers.get("content-type", "").startswith("application/json"):
+                server_error_details = json.loads(response.text)
+                return server_error_details
+        except json.JSONDecodeError:
+            pass
+            
+        # Try to extract FastAPI validation error format
+        if response.status_code == 422 and response.text:
+            try:
+                # FastAPI validation errors have a specific format
+                validation_error = json.loads(response.text)
+                if "detail" in validation_error and isinstance(validation_error["detail"], list):
+                    return validation_error
+            except json.JSONDecodeError:
+                pass
+                
+        # Try to extract traceback information from HTML responses (common in 500 errors)
+        if response.status_code == 500 and response.text and "<html" in response.text.lower():
+            import re
+            # Look for traceback in HTML
+            traceback_match = re.search(r'<pre[^>]*>(.*?)</pre>', response.text, re.DOTALL)
+            if traceback_match:
+                return {"traceback": traceback_match.group(1)}
+                
+        return server_error_details
+        
     async def _request(
         self,
         client: httpx.AsyncClient,

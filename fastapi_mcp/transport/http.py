@@ -53,7 +53,7 @@ class FastApiHttpSessionManager:
                 app=self.mcp_server,
                 event_store=self.event_store,
                 json_response=self.json_response,
-                stateless=False,  # Always support sessions, but they're optional
+                stateless=True,  # Always stateless - maybe fixes multi-worker environments?
                 security_settings=self.security_settings,
             )
 

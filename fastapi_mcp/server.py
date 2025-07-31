@@ -566,7 +566,7 @@ class FastApiMCP:
                 return [types.TextContent(type="text", text=result_text)]
 
         except Exception as e:
-            logger.exception(f"Error calling {tool_name}")
+            logger.exception(f"Error calling {tool_name}: {e}")
             raise e
 
     async def _request(
